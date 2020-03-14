@@ -1,0 +1,349 @@
+#!/bin/bash
+
+DEFAULT_GW=""
+
+function reconfIface(){
+	IFACE="$1"
+	IFACE_PATH="/etc/network/interfaces.d/$IFACE"
+	
+	ADDRESS=""
+	MASK=""
+	GATEWAY=""
+	DNS=""
+
+	ip addr flush dev $IFACE
+	if [ -f "$IFACE_PATH" ];then
+		whiptail --title "Configure interface" --yesno "Do you want to configure $IFACE" --defaultno 10 60
+	else
+		whiptail --title "Configure interface" --yesno "Do you want to configure $IFACE" 10 60
+	fi
+	
+	if [ $? -eq 0 ];then
+		if [ -f "$IFACE_PATH" ];then
+			grep -i "dhcp" "$IFACE_PATH" > /dev/null 
+			if [ $? -eq 0 ];then
+				whiptail --title "Configure interface $IFACE" --yesno "Do you want to assign IP by DHCP?" 10 60
+			else
+				whiptail --title "Configure interface $IFACE" --yesno "Do you want to assign IP by DHCP?" --defaultno 10 60
+			fi
+		else
+			whiptail --title "Configure interface $IFACE" --yesno "Do you want to assign IP by DHCP?" --defaultno 10 60
+		fi
+
+		if [ $? -eq 0 ];then
+			cat > $IFACE_PATH << EOF
+allow-hotplug $IFACE
+auto $IFACE
+iface $IFACE inet dhcp
+post-up iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
+EOF
+			dhclient -v $IFACE
+		else
+			if [ -f "$IFACE_PATH" ];then
+				ADDRESS=`cat $IFACE_PATH | grep -oP "(?<=address).+" | tr -d " " | tr -d "\t"`
+				MASK=`cat $IFACE_PATH | grep -oP "(?<=netmask).+" | tr -d " " | tr -d "\t"`
+				GATEWAY=`cat $IFACE_PATH | grep -oP "(?<=gateway).+" | tr -d " " | tr -d "\t"`
+			fi
+
+			# ASKING INPUTS FROM USER
+			ADDRESS=`whiptail --title "Configuring $IFACE" --inputbox "IP Address" 10 60 "$ADDRESS" 3>&1 1>&2 2>&3`
+			MASK=`whiptail --title "Configuring $IFACE" --inputbox "Netmask" 10 60 "$MASK" 3>&1 1>&2 2>&3`
+			GATEWAY=`whiptail --title "Configuring $IFACE" --inputbox "Gateway" 10 60 "$GATEWAY" 3>&1 1>&2 2>&3`
+	
+			# WRITING ANSWERS
+			cat > $IFACE_PATH << EOF
+
+allow-hotplug $IFACE
+auto $IFACE
+iface $IFACE inet static
+address $ADDRESS
+netmask $MASK
+EOF
+
+			if [ "$GATEWAY" != "" ];then
+				echo "gateway $GATEWAY" >> $IFACE_PATH
+				whiptail --title "Configure interface $IFACE" --yesno "Do you want to set this interface as default gateway?" --defaultno 10 60
+				if [ $? -eq 0 ];then
+					DEFAULT_GW=$IFACE
+				fi
+			fi
+				echo "post-up iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
+" >> $IFACE_PATH
+		fi # End assign ip by DHCP or not
+	
+
+	fi # End if want to configure interface
+
+
+	sleep .5
+}
+
+function deleteOldIfaces(){
+	IFACES="$1"
+	echo "" > /tmp/IFACES
+	for iface in $IFACES;do
+		echo $iface >> /tmp/IFACES
+	done
+
+
+	IFACE_FILES=$(cd /etc/network/interfaces.d/ && ls *)
+	echo "" > /tmp/IFACE_FILES
+	for item in $IFACE_FILES;do
+		echo $item >> /tmp/IFACE_FILES	
+	done
+
+
+	FILES_TO_DELETE=$(grep -Fxv -f /tmp/IFACES /tmp/IFACE_FILES)
+	for item in $FILES_TO_DELETE;do
+		fpath="/etc/network/interfaces.d/$item"
+		echo "Removing $fpath"
+		rm "$fpath"
+	done
+
+	rm /tmp/IFACE_FILES
+	rm /tmp/IFACES
+
+}
+
+
+function isSniffing(){
+	IFACE=$1
+	ps faux | grep "tcpdump -i $IFACE " | grep -v "grep" > /dev/null 2>&1
+	return $?
+}
+
+function ntp(){
+	echo "ntp"
+
+	
+menu=$(whiptail --title "Time synchronisation" --radiolist \
+"Do you want to synchronise time with NTP?" 15 60 4 \
+"yes" "yes" ON \
+"no" "no" OFF 3>&1 1>&2 2>&3)
+ 
+choice=$?
+if [ $choice = 0 ]; then
+    echo "Vous avez choisi la distribution :" $DISTROS
+else
+    echo "Vous avez annulé"
+fi
+}
+
+function capture(){
+
+	# Construction de la commande à exécuter
+	IFACES=$(ip a | grep "^[0-9]*: [^lo]" | cut -d ":" -f 2 | tr -d " ")
+	CMD='whiptail --title "Interfaces" --menu "Choose a network interface to capture" 15 60 3'
+	for IFACE in $IFACES;do
+		CMD="$CMD $IFACE ''"
+	done
+	CMD="$CMD any ''"
+	CMD="$CMD 3>&1 1>&2 2>&3"
+
+	# Exécution de la commande pour récupérer l'interface sur laquelle l'utilisateur souhaite écouter
+	IFACE=`eval $CMD`
+
+	PCAP_DIR="/opt/fpc"
+
+	isSniffing $IFACE
+
+	if [ $? -eq 0 ];then
+		whiptail --title "Capture packet" --yesno "Do yo want to stop recording on $IFACE?" 10 60
+		if [ $? -eq 0 ];then
+			for PID in `ps -x | grep "tcpdump -i $IFACE" | grep -v grep | grep -oP "(?<=\s)\d+(?=\s)"`;do
+				kill $PID > /dev/null 2>&1 &
+			done
+		fi
+	else
+		tcpdump -i $IFACE -w "$PCAP_DIR/`date +%Y-%m-%d_%T`-$IFACE.pcap" -C 100 -W 10 -s0 -z gzip > /dev/null 2>&1 &
+	fi
+}
+
+
+function dns(){
+	isBindRunning=$(pgrep named)
+
+        if [ $? -ne 0 ];then
+                whiptail --title "Configure DNS relay" --yesno "Do you want to enable DNS relay feature" --defaultno 10 60
+        else
+                whiptail --title "Configure DNS relay" --yesno "Do you want to enable DNS relay feature" 10 60
+	fi
+
+
+        if [ $? -ne 0 ];then
+		systemctl stop bind9
+		systemctl disable bind9
+        else
+    		IPS=`grep -oP "(?<=forwarders {).+?(?=})" /etc/bind/named.conf.options | tr -d " "`
+    		IPS=`whiptail --title "Configuring DNS relay" --inputbox "DNS servers to perform name resolution" 10 60 "$IPS" 3>&1 1>&2 2>&3`
+		perl -p -i -e "s/(?<=forwarders \{).+/ `echo $IPS` \};/g" /etc/bind/named.conf.options
+	        systemctl enable bind9
+	        systemctl restart bind9
+        fi
+
+
+
+
+}
+
+
+function main(){
+
+IFACES=$(ip a | grep "^[0-9]*: [^lo]" | cut -d ":" -f 2 | tr -d " ")
+# Clean iptables
+iptables -F -t nat
+
+deleteOldIfaces "$IFACES"
+
+for iface in $IFACES;do
+	reconfIface "$iface"
+done
+
+echo "systemctl restart networking.service"
+systemctl restart networking.service
+
+
+# On récupère l'@IP de la gateway de l'interface en question
+if [ "$DEFAULT_GW" != "" ];then
+	ip=`cat /etc/network/interfaces.d/$DEFAULT_GW | grep -oP "(?<=gateway ).+"`
+
+	if [ "$ip" != "" ];then
+		ip route flush 0/0
+		route add default gw $ip $DEFAULT_GW
+	else
+		echo "Impossible de récupérer l'ip de la gateway"
+	fi
+fi
+
+}
+
+
+
+
+# ==========================
+# ========== MAIN ==========
+# ==========================
+
+
+# ----- MAIN MENU -----
+while true;do
+
+	MESSAGE="Network interfaces:\n"
+	
+	GW=`ip route show | grep -oP "(?<=default via ).+?(?= )"`
+	IFGW=`ip route show | grep -oP "(?<=default via ).+" | cut -d " " -f 3`
+	for iface in $(ls /etc/network/interfaces.d/*);do
+		iface=`basename $iface`
+		ip=`ip a show $iface | grep -oP "(?<=inet ).+?(?= )"`
+		
+		if [ "$IFGW" == "$iface" ];then
+			MESSAGE="$MESSAGE  $iface: $ip (default gateway)"
+		else
+			MESSAGE="$MESSAGE  $iface: $ip"
+		fi
+
+
+		isSniffing $iface
+
+		if [ $? -eq 0 ];then
+			MESSAGE="$MESSAGE [REC]"
+		fi
+
+		MESSAGE="$MESSAGE \n"
+	done
+
+
+	DHCPSERVERS=$(cat /etc/default/isc-dhcp-relay | grep -oP "(?<=SERVERS=\").+?(?=\")" | tr " " "\n")
+	if [ "$DHCPSERVERS" != "" ];then
+		MESSAGE="$MESSAGE\nDHCP relay enabled for:"
+		for server in $DHCPSERVERS;do
+			MESSAGE="$MESSAGE\n  $server"
+		done
+	else
+		MESSAGE="$MESSAGE\nNo server declared in DHCP relay configuration"
+	fi
+
+	ping -c 1 1.1.1.1 > /dev/null 2>&1
+	if [ $? -eq 0 ];then
+		MESSAGE="$MESSAGE\n\nInternet detected: YES"
+	else
+		MESSAGE="$MESSAGE\n\nInternet detected: NO"
+	fi
+
+	MESSAGE="$MESSAGE\n\nRecorded PCAP files are available on each network interface (http/8000)"
+
+	# DETERMINE NTP RUNNING
+	netstat -paun | grep "/ntpd " | grep ":123 " > /dev/null
+	if [ $? -ne 0 ];then
+		MESSAGE="$MESSAGE\n\nTime synchronisation: NO"
+	else
+		MESSAGE="$MESSAGE\n\nTime synchronisation: YES"
+		SERVERS=$(grep "iburst" /etc/ntp.conf | cut -d " " -f 2)
+		for SERVER in $SERVERS;do
+			MESSAGE="$MESSAGE\n   [+] $SERVER"
+		done
+
+	fi
+
+	# DETERMINE BIND RUNNING
+	pgrep named
+	if [ $? -ne 0 ];then
+		MESSAGE="$MESSAGE\n\nDNS Relay: NO"
+	else
+		MESSAGE="$MESSAGE\n\nDNS Relay: YES"
+    		SERVERS=`grep -oP "(?<=forwarders {).+?(?=})" /etc/bind/named.conf.options | tr  ";" " "`
+		for SERVER in $SERVERS;do
+			MESSAGE="$MESSAGE\n   [+] $SERVER"
+		done
+
+	fi
+	whiptail --title "Informations" --msgbox "$MESSAGE" 30 60
+
+
+
+
+OPTION=$(whiptail --title "Menu" --menu "What do you want to do" 15 60 7 \
+	"1" "Shutdown" \
+	"2" "Reboot" \
+	"3" "Reconfigure network interfaces" \
+	"4" "Shell" \
+	"5" "Reconfigure DHCP relay" \
+	"6" "Time synchronisation" \
+	"7" "Sniff network" \
+	"8" "Reconfigure DNS relay" 3>&1 1>&2 2>&3)
+
+if [ $? -ne 0 ];then
+	echo "Action annulée"
+else
+
+	if [ "$OPTION" == "1" ];then
+		poweroff
+	fi
+	if [ "$OPTION" == "2" ];then
+		reboot
+	fi
+	if [ "$OPTION" == "3" ];then
+		main
+	fi
+	if [ "$OPTION" == "4" ];then
+		exit
+	fi
+	if [ "$OPTION" == "5" ];then
+		dpkg-reconfigure isc-dhcp-relay
+		/etc/init.d/isc-dhcp-relay restart
+	fi
+	if [ "$OPTION" == "6" ];then
+		ntp
+	fi
+	if [ "$OPTION" == "7" ];then
+		capture
+	fi
+	if [ "$OPTION" == "8" ];then
+		dns
+	fi
+
+
+fi
+done
+
+
