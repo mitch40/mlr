@@ -37,6 +37,7 @@ EOF
 	export DEBIAN_FRONTEND
 
 	apt update && apt install -y \
+	        bind9 \
 		htop \
 		isc-dhcp-relay \
 		net-tools \
